@@ -1,0 +1,265 @@
+#########################################
+# LUAD age-bin transcriptomic analysis
+# Lollipop plots for common ORA results
+#########################################
+
+rm(list = ls())
+set.seed(123)
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+})
+
+# Avoid namespace conflicts
+filter  <- dplyr::filter
+arrange <- dplyr::arrange
+mutate  <- dplyr::mutate
+
+# -------------------------------------------------------------------------
+# Project paths and parameters
+# -------------------------------------------------------------------------
+
+# Run this script from the project directory containing the enrich_common folder.
+# If needed, replace getwd() with the path to the original analysis directory.
+ROOT <- getwd()
+
+IN_DIR  <- file.path(ROOT, "enrich_common")
+OUT_DIR <- file.path(IN_DIR, "plots_lollipop")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+BINS <- c("young", "old")
+DIRS <- c("UP", "DOWN")
+
+BIN_LABELS <- c(
+  young = "<60 years",
+  old   = "\u226560 years"
+)
+
+TOP_N   <- 5
+FDR_REF <- 0.05
+WRAP_W  <- 55
+
+# -------------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------------
+
+clean_term <- function(x) {
+  x <- stringr::str_squish(x)
+  x <- gsub("_", " ", x)
+
+  is_all_caps <- function(s) {
+    letters <- gsub("[^A-Za-z]", "", s)
+    if (!nzchar(letters)) return(FALSE)
+    toupper(letters) == letters
+  }
+
+  vapply(x, function(s) {
+    if (is.na(s)) return(NA_character_)
+    s <- stringr::str_squish(s)
+    s <- gsub("_", " ", s)
+
+    if (is_all_caps(s)) {
+      return(stringr::str_to_title(stringr::str_to_lower(s)))
+    }
+
+    first <- substr(s, 1, 1)
+    rest  <- substr(s, 2, nchar(s))
+    paste0(toupper(first), rest)
+  }, character(1))
+}
+
+read_enrich <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  x <- readr::read_tsv(path, show_col_types = FALSE)
+  if (!nrow(x)) return(NULL)
+  x
+}
+
+prep_cat <- function(path, catlab, top_n = TOP_N) {
+  df <- read_enrich(path)
+  if (is.null(df) || !nrow(df)) return(NULL)
+
+  pcol <- intersect(c("p.adjust", "qvalue", "qvalues", "padj", "pval", "pvalue"),
+                    names(df))[1]
+  if (is.na(pcol)) stop("No adjusted p-value column found in: ", path)
+
+  if (!"Description" %in% names(df)) {
+    dcol <- intersect(c("Description", "Term", "description", "ID"), names(df))[1]
+    if (is.na(dcol)) stop("No description column found in: ", path)
+    names(df)[names(df) == dcol] <- "Description"
+  }
+
+  if (!"Count" %in% names(df)) {
+    ccol <- intersect(c("Count", "Gene.count", "GeneRatio"), names(df))[1]
+    if (is.na(ccol)) {
+      df$Count <- NA_integer_
+    } else {
+      names(df)[names(df) == ccol] <- "Count"
+    }
+  }
+
+  df %>%
+    mutate(
+      Category = catlab,
+      p_adj    = .data[[pcol]],
+      score    = -log10(p_adj)
+    ) %>%
+    filter(is.finite(score)) %>%
+    arrange(desc(score)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    mutate(
+      Term_raw   = stringr::str_squish(Description),
+      Term_clean = clean_term(Term_raw),
+      Term_clean = stringr::str_trunc(Term_clean, width = 80),
+      Label      = sprintf("%s  (%s)", Term_clean, Category)
+    )
+}
+
+# -------------------------------------------------------------------------
+# Plotting function
+# -------------------------------------------------------------------------
+
+make_lollipop <- function(bin, direction,
+                          top_n = TOP_N,
+                          xmax = NULL,
+                          wrap_width = WRAP_W) {
+
+  bin_label <- BIN_LABELS[[bin]]
+  pref <- file.path(IN_DIR, sprintf("%s_%s_ORA_common", bin, direction))
+
+  bp <- prep_cat(paste0(pref, "_GO_BP.tsv"),   "GO:BP",   top_n)
+  cc <- prep_cat(paste0(pref, "_GO_CC.tsv"),   "GO:CC",   top_n)
+  mf <- prep_cat(paste0(pref, "_GO_MF.tsv"),   "GO:MF",   top_n)
+  pw <- prep_cat(paste0(pref, "_PATHWAY.tsv"), "Pathway", top_n)
+
+  all_terms <- dplyr::bind_rows(bp, cc, mf, pw)
+  if (!nrow(all_terms)) {
+    message("No enriched terms for ", bin_label, " / ", direction)
+    return(invisible(NULL))
+  }
+
+  all_terms <- all_terms %>%
+    mutate(
+      Label_raw = Label,
+      .order    = rank(-score, ties.method = "first")
+    ) %>%
+    arrange(.order)
+
+  ord_raw     <- unique(all_terms$Label_raw[order(all_terms$score, decreasing = TRUE)])
+  ord_wrapped <- stringr::str_wrap(ord_raw, width = wrap_width)
+
+  all_terms <- all_terms %>%
+    mutate(
+      Label = stringr::str_wrap(Label_raw, width = wrap_width),
+      Label = factor(Label, levels = rev(ord_wrapped))
+    )
+
+  pal_cat <- c(
+    "GO:BP"   = "#EF8A62",
+    "GO:CC"   = "#7FBC41",
+    "GO:MF"   = "#67A9CF",
+    "Pathway" = "#B29DD9"
+  )
+  lty_cat <- c(
+    "GO:BP"   = "solid",
+    "GO:CC"   = "dashed",
+    "GO:MF"   = "dotted",
+    "Pathway" = "dotdash"
+  )
+
+  fdr_line <- -log10(FDR_REF)
+  n_terms  <- nrow(all_terms)
+
+  local_max <- max(all_terms$score, na.rm = TRUE)
+  base_max  <- if (is.null(xmax)) local_max else xmax
+  dx        <- 0.08 * base_max
+  x_lim_max <- base_max + dx + 0.5
+
+  p <- ggplot(all_terms, aes(x = score, y = Label, colour = Category)) +
+    geom_segment(aes(x = 0, xend = score, yend = Label, linetype = Category),
+                 linewidth = 0.9, alpha = 0.9) +
+    geom_vline(xintercept = fdr_line,
+               linetype = "dashed", colour = "grey50", linewidth = 0.5) +
+    geom_point(size = 3.4, stroke = 0.3) +
+    geom_text(
+      aes(x = score + dx,
+          label = ifelse(is.na(Count), "", paste0("n=", Count))),
+      hjust = 0, vjust = 0.1, size = 3.0, colour = "grey20"
+    ) +
+    scale_colour_manual(values = pal_cat, name = "Category") +
+    scale_linetype_manual(values = lty_cat, name = "Category") +
+    scale_x_continuous(
+      limits = c(0, x_lim_max),
+      breaks = seq(0, x_lim_max, by = 2.5),
+      expand = c(0, 0)
+    ) +
+    coord_cartesian(clip = "off") +
+    labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      title = sprintf("%s — %s — common enriched terms", bin_label, direction),
+      subtitle = "Dot = term; line = magnitude; dashed line = FDR 0.05; label = gene count"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor    = element_blank(),
+      panel.grid.major.y  = element_blank(),
+      legend.position     = "right",
+      plot.title.position = "plot",
+      plot.margin         = margin(10, 30, 10, 22),
+      axis.text.y         = element_text(size = 8)
+    )
+
+  out_png <- file.path(OUT_DIR, sprintf("panel_%s_%s_lollipop.png", bin, direction))
+  out_pdf <- sub("\\.png$", ".pdf", out_png)
+
+  ggsave(out_png, p,
+         width  = 12,
+         height = max(5.5, min(18, 3 + 0.26 * n_terms)),
+         dpi    = 400)
+  ggsave(out_pdf, p,
+         width  = 12,
+         height = max(5.5, min(18, 3 + 0.26 * n_terms)),
+         device = grDevices::cairo_pdf)
+
+  message("Saved: ", out_png, " (", bin_label, " / ", direction, ")")
+  invisible(p)
+}
+
+get_global_xmax <- function(bins = BINS, dirs = DIRS, top_n = TOP_N) {
+  scores <- c()
+
+  for (b in bins) {
+    for (d in dirs) {
+      pref <- file.path(IN_DIR, sprintf("%s_%s_ORA_common", b, d))
+      for (cat in c("GO_BP", "GO_CC", "GO_MF", "PATHWAY")) {
+        pth <- paste0(pref, "_", cat, ".tsv")
+        tmp <- try(prep_cat(pth, catlab = cat, top_n = top_n), silent = TRUE)
+        if (!inherits(tmp, "try-error") && !is.null(tmp) && nrow(tmp)) {
+          scores <- c(scores, tmp$score)
+        }
+      }
+    }
+  }
+
+  if (!length(scores)) return(10)
+  xmax <- max(scores, na.rm = TRUE)
+  ceiling(xmax * 1.15 * 2) / 2
+}
+
+# -------------------------------------------------------------------------
+# Run lollipop plots
+# -------------------------------------------------------------------------
+
+GLOBAL_XMAX <- get_global_xmax()
+message("Global x-axis maximum: ", GLOBAL_XMAX)
+
+make_lollipop("old",   "UP",   xmax = GLOBAL_XMAX)
+make_lollipop("old",   "DOWN", xmax = GLOBAL_XMAX)
+make_lollipop("young", "UP",   xmax = GLOBAL_XMAX)
+make_lollipop("young", "DOWN", xmax = GLOBAL_XMAX)
+
+message("Done. Check: ", OUT_DIR)

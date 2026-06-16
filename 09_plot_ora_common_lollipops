@@ -1,6 +1,6 @@
 #########################################
-# LUAD age-bin transcriptomic analysis
-# Lollipop plots for common ORA results
+# LUAD age-bin analysis
+# ORA for concordant DEG lists
 #########################################
 
 rm(list = ls())
@@ -9,257 +9,296 @@ set.seed(123)
 suppressPackageStartupMessages({
   library(readr)
   library(dplyr)
-  library(ggplot2)
+  library(tidyr)
   library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(msigdbr)
 })
 
-# Avoid namespace conflicts
-filter  <- dplyr::filter
-arrange <- dplyr::arrange
-mutate  <- dplyr::mutate
+# This script performs over-representation analysis (ORA) on concordant
+# genes shared by GSE115002 and GSE75037 within each age bin.
+# It writes tables used by the lollipop plotting script.
+# Positive logFC corresponds to higher expression in Tumor vs Normal.
 
-# -------------------------------------------------------------------------
-# Project paths and parameters
-# -------------------------------------------------------------------------
+select    <- dplyr::select
+filter    <- dplyr::filter
+arrange   <- dplyr::arrange
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+transmute <- dplyr::transmute
 
-# Run this script from the project directory containing the enrich_common folder.
-# If needed, replace getwd() with the path to the original analysis directory.
-ROOT <- getwd()
-
-IN_DIR  <- file.path(ROOT, "enrich_common")
-OUT_DIR <- file.path(IN_DIR, "plots_lollipop")
+# Set the working directory to the project root before running this script.
+ROOT    <- getwd()
+DEA_DIR <- file.path(ROOT, "dea")
+FIG_DIR <- file.path(ROOT, "figs")
+OUT_DIR <- file.path(ROOT, "enrich_common")
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-BINS <- c("young", "old")
-DIRS <- c("UP", "DOWN")
-
-BIN_LABELS <- c(
-  young = "<60 years",
-  old   = "\u226560 years"
-)
-
+GSES    <- c("GSE115002", "GSE75037")
+BINS    <- c("young", "old")
+FDR_CUT <- 0.05
+LFC_MIN <- 1
 TOP_N   <- 5
-FDR_REF <- 0.05
-WRAP_W  <- 55
 
-# -------------------------------------------------------------------------
-# Helper functions
-# -------------------------------------------------------------------------
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 
-clean_term <- function(x) {
-  x <- stringr::str_squish(x)
-  x <- gsub("_", " ", x)
-
-  is_all_caps <- function(s) {
-    letters <- gsub("[^A-Za-z]", "", s)
-    if (!nzchar(letters)) return(FALSE)
-    toupper(letters) == letters
-  }
-
-  vapply(x, function(s) {
-    if (is.na(s)) return(NA_character_)
-    s <- stringr::str_squish(s)
-    s <- gsub("_", " ", s)
-
-    if (is_all_caps(s)) {
-      return(stringr::str_to_title(stringr::str_to_lower(s)))
-    }
-
-    first <- substr(s, 1, 1)
-    rest  <- substr(s, 2, nchar(s))
-    paste0(toupper(first), rest)
-  }, character(1))
-}
-
-read_enrich <- function(path) {
-  if (!file.exists(path)) return(NULL)
-  x <- readr::read_tsv(path, show_col_types = FALSE)
-  if (!nrow(x)) return(NULL)
+as_chr <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- NA_character_
   x
 }
 
-prep_cat <- function(path, catlab, top_n = TOP_N) {
-  df <- read_enrich(path)
-  if (is.null(df) || !nrow(df)) return(NULL)
+load_dea <- function(gse, bin) {
+  cand <- c(
+    file.path(DEA_DIR, sprintf("%s___TvN_%s.tsv", gse, bin)),
+    file.path(DEA_DIR, sprintf("%s__TvN_%s.tsv",  gse, bin))
+  )
+  f <- cand[file.exists(cand)][1]
+  if (is.na(f)) stop("DEA file not found for ", gse, " / ", bin)
 
-  pcol <- intersect(c("p.adjust", "qvalue", "qvalues", "padj", "pval", "pvalue"),
-                    names(df))[1]
-  if (is.na(pcol)) stop("No adjusted p-value column found in: ", path)
+  tt <- readr::read_tsv(f, show_col_types = FALSE)
 
-  if (!"Description" %in% names(df)) {
-    dcol <- intersect(c("Description", "Term", "description", "ID"), names(df))[1]
-    if (is.na(dcol)) stop("No description column found in: ", path)
-    names(df)[names(df) == dcol] <- "Description"
+  if (!"GENE" %in% names(tt)) {
+    gcol <- c("Gene", "SYMBOL", "symbol", "gene", "ID")
+    gcol <- gcol[gcol %in% names(tt)][1]
+    if (is.na(gcol)) stop("No recognizable gene column in: ", f)
+    names(tt)[names(tt) == gcol] <- "GENE"
   }
 
-  if (!"Count" %in% names(df)) {
-    ccol <- intersect(c("Count", "Gene.count", "GeneRatio"), names(df))[1]
-    if (is.na(ccol)) {
-      df$Count <- NA_integer_
+  if (!"FDR" %in% names(tt)) {
+    if ("adj.P.Val" %in% names(tt)) {
+      tt$FDR <- tt$adj.P.Val
+    } else if ("P.Value" %in% names(tt)) {
+      tt$FDR <- p.adjust(tt$P.Value, method = "BH")
     } else {
-      names(df)[names(df) == ccol] <- "Count"
+      stop("No FDR, adj.P.Val, or P.Value column in: ", f)
     }
   }
 
-  df %>%
+  if (!"logFC" %in% names(tt)) stop("No logFC column in: ", f)
+
+  tt %>%
     mutate(
-      Category = catlab,
-      p_adj    = .data[[pcol]],
-      score    = -log10(p_adj)
+      GENE = as_chr(GENE),
+      FDR = as.numeric(FDR),
+      logFC = as.numeric(logFC)
     ) %>%
-    filter(is.finite(score)) %>%
-    arrange(desc(score)) %>%
-    dplyr::slice_head(n = top_n) %>%
-    mutate(
-      Term_raw   = stringr::str_squish(Description),
-      Term_clean = clean_term(Term_raw),
-      Term_clean = stringr::str_trunc(Term_clean, width = 80),
-      Label      = sprintf("%s  (%s)", Term_clean, Category)
-    )
+    filter(!is.na(GENE), is.finite(FDR), is.finite(logFC))
 }
 
-# -------------------------------------------------------------------------
-# Plotting function
-# -------------------------------------------------------------------------
+get_common_list <- function(bin, direction) {
+  txt_candidates <- c(
+    file.path(FIG_DIR, sprintf("common_%s_%s.txt", bin, direction)),
+    file.path(OUT_DIR, sprintf("common_%s_%s.txt", bin, direction))
+  )
+  txt <- txt_candidates[file.exists(txt_candidates)][1]
 
-make_lollipop <- function(bin, direction,
-                          top_n = TOP_N,
-                          xmax = NULL,
-                          wrap_width = WRAP_W) {
-
-  bin_label <- BIN_LABELS[[bin]]
-  pref <- file.path(IN_DIR, sprintf("%s_%s_ORA_common", bin, direction))
-
-  bp <- prep_cat(paste0(pref, "_GO_BP.tsv"),   "GO:BP",   top_n)
-  cc <- prep_cat(paste0(pref, "_GO_CC.tsv"),   "GO:CC",   top_n)
-  mf <- prep_cat(paste0(pref, "_GO_MF.tsv"),   "GO:MF",   top_n)
-  pw <- prep_cat(paste0(pref, "_PATHWAY.tsv"), "Pathway", top_n)
-
-  all_terms <- dplyr::bind_rows(bp, cc, mf, pw)
-  if (!nrow(all_terms)) {
-    message("No enriched terms for ", bin_label, " / ", direction)
-    return(invisible(NULL))
+  if (!is.na(txt)) {
+    genes <- readLines(txt, warn = FALSE)
+    genes <- unique(genes[nzchar(genes)])
+    return(genes)
   }
 
-  all_terms <- all_terms %>%
-    mutate(
-      Label_raw = Label,
-      .order    = rank(-score, ties.method = "first")
-    ) %>%
-    arrange(.order)
+  t115 <- load_dea("GSE115002", bin)
+  t750 <- load_dea("GSE75037", bin)
 
-  ord_raw     <- unique(all_terms$Label_raw[order(all_terms$score, decreasing = TRUE)])
-  ord_wrapped <- stringr::str_wrap(ord_raw, width = wrap_width)
+  if (direction == "UP") {
+    s115 <- t115 %>% filter(FDR <= FDR_CUT, logFC >=  LFC_MIN) %>% pull(GENE)
+    s750 <- t750 %>% filter(FDR <= FDR_CUT, logFC >=  LFC_MIN) %>% pull(GENE)
+  } else {
+    s115 <- t115 %>% filter(FDR <= FDR_CUT, logFC <= -LFC_MIN) %>% pull(GENE)
+    s750 <- t750 %>% filter(FDR <= FDR_CUT, logFC <= -LFC_MIN) %>% pull(GENE)
+  }
 
-  all_terms <- all_terms %>%
-    mutate(
-      Label = stringr::str_wrap(Label_raw, width = wrap_width),
-      Label = factor(Label, levels = rev(ord_wrapped))
-    )
-
-  pal_cat <- c(
-    "GO:BP"   = "#EF8A62",
-    "GO:CC"   = "#7FBC41",
-    "GO:MF"   = "#67A9CF",
-    "Pathway" = "#B29DD9"
-  )
-  lty_cat <- c(
-    "GO:BP"   = "solid",
-    "GO:CC"   = "dashed",
-    "GO:MF"   = "dotted",
-    "Pathway" = "dotdash"
-  )
-
-  fdr_line <- -log10(FDR_REF)
-  n_terms  <- nrow(all_terms)
-
-  local_max <- max(all_terms$score, na.rm = TRUE)
-  base_max  <- if (is.null(xmax)) local_max else xmax
-  dx        <- 0.08 * base_max
-  x_lim_max <- base_max + dx + 0.5
-
-  p <- ggplot(all_terms, aes(x = score, y = Label, colour = Category)) +
-    geom_segment(aes(x = 0, xend = score, yend = Label, linetype = Category),
-                 linewidth = 0.9, alpha = 0.9) +
-    geom_vline(xintercept = fdr_line,
-               linetype = "dashed", colour = "grey50", linewidth = 0.5) +
-    geom_point(size = 3.4, stroke = 0.3) +
-    geom_text(
-      aes(x = score + dx,
-          label = ifelse(is.na(Count), "", paste0("n=", Count))),
-      hjust = 0, vjust = 0.1, size = 3.0, colour = "grey20"
-    ) +
-    scale_colour_manual(values = pal_cat, name = "Category") +
-    scale_linetype_manual(values = lty_cat, name = "Category") +
-    scale_x_continuous(
-      limits = c(0, x_lim_max),
-      breaks = seq(0, x_lim_max, by = 2.5),
-      expand = c(0, 0)
-    ) +
-    coord_cartesian(clip = "off") +
-    labs(
-      x = expression(-log[10]("FDR")),
-      y = NULL,
-      title = sprintf("%s — %s — common enriched terms", bin_label, direction),
-      subtitle = "Dot = term; line = magnitude; dashed line = FDR 0.05; label = gene count"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(
-      panel.grid.minor    = element_blank(),
-      panel.grid.major.y  = element_blank(),
-      legend.position     = "right",
-      plot.title.position = "plot",
-      plot.margin         = margin(10, 30, 10, 22),
-      axis.text.y         = element_text(size = 8)
-    )
-
-  out_png <- file.path(OUT_DIR, sprintf("panel_%s_%s_lollipop.png", bin, direction))
-  out_pdf <- sub("\\.png$", ".pdf", out_png)
-
-  ggsave(out_png, p,
-         width  = 12,
-         height = max(5.5, min(18, 3 + 0.26 * n_terms)),
-         dpi    = 400)
-  ggsave(out_pdf, p,
-         width  = 12,
-         height = max(5.5, min(18, 3 + 0.26 * n_terms)),
-         device = grDevices::cairo_pdf)
-
-  message("Saved: ", out_png, " (", bin_label, " / ", direction, ")")
-  invisible(p)
+  genes <- intersect(unique(s115), unique(s750))
+  dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+  writeLines(genes, file.path(FIG_DIR, sprintf("common_%s_%s.txt", bin, direction)))
+  genes
 }
 
-get_global_xmax <- function(bins = BINS, dirs = DIRS, top_n = TOP_N) {
-  scores <- c()
+to_entrez <- function(symbols) {
+  symbols <- unique(toupper(as_chr(symbols)))
+  symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+  suppressMessages(
+    clusterProfiler::bitr(
+      symbols,
+      fromType = "SYMBOL",
+      toType   = "ENTREZID",
+      OrgDb    = org.Hs.eg.db
+    )
+  ) %>%
+    distinct(SYMBOL, .keep_all = TRUE) %>%
+    filter(!is.na(ENTREZID))
+}
 
-  for (b in bins) {
-    for (d in dirs) {
-      pref <- file.path(IN_DIR, sprintf("%s_%s_ORA_common", b, d))
-      for (cat in c("GO_BP", "GO_CC", "GO_MF", "PATHWAY")) {
-        pth <- paste0(pref, "_", cat, ".tsv")
-        tmp <- try(prep_cat(pth, catlab = cat, top_n = top_n), silent = TRUE)
-        if (!inherits(tmp, "try-error") && !is.null(tmp) && nrow(tmp)) {
-          scores <- c(scores, tmp$score)
-        }
-      }
+msig_term2gene <- function() {
+  kegg_tbl <- tryCatch(
+    msigdbr::msigdbr(
+      species = "Homo sapiens",
+      collection = "C2",
+      subcollection = "CP:KEGG"
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(kegg_tbl) || !nrow(kegg_tbl)) {
+    kegg_tbl <- tryCatch(
+      msigdbr::msigdbr(
+        species = "Homo sapiens",
+        category = "C2",
+        subcategory = "CP:KEGG"
+      ),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(kegg_tbl) || !nrow(kegg_tbl)) {
+    message("C2:CP:KEGG was not available in msigdbr; using C2:CP:REACTOME instead.")
+    kegg_tbl <- tryCatch(
+      msigdbr::msigdbr(
+        species = "Homo sapiens",
+        collection = "C2",
+        subcollection = "CP:REACTOME"
+      ),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(kegg_tbl) || !nrow(kegg_tbl)) {
+    kegg_tbl <- tryCatch(
+      msigdbr::msigdbr(
+        species = "Homo sapiens",
+        category = "C2",
+        subcategory = "CP:REACTOME"
+      ),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(kegg_tbl) || !nrow(kegg_tbl)) {
+    stop("No KEGG or Reactome gene sets were available through msigdbr.")
+  }
+
+  kegg_tbl %>%
+    select(gs_name, gene_symbol) %>%
+    distinct()
+}
+
+run_enrich_go <- function(genes_entrez, universe_entrez, ont) {
+  if (length(genes_entrez) < 10 || length(universe_entrez) < 100) return(NULL)
+  tryCatch(
+    enrichGO(
+      gene          = genes_entrez,
+      universe      = universe_entrez,
+      OrgDb         = org.Hs.eg.db,
+      keyType       = "ENTREZID",
+      ont           = ont,
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 1,
+      qvalueCutoff  = 1,
+      readable      = TRUE
+    ),
+    error = function(e) NULL
+  )
+}
+
+run_enrich_terms <- function(genes, universe, term2gene) {
+  if (length(genes) < 10 || !nrow(term2gene)) return(NULL)
+  tryCatch(
+    enricher(
+      gene          = genes,
+      TERM2GENE     = term2gene,
+      universe      = universe,
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 1,
+      qvalueCutoff  = 1
+    ),
+    error = function(e) NULL
+  )
+}
+
+save_table <- function(df, path) {
+  if (is.null(df)) return(invisible(NULL))
+  dd <- as.data.frame(df)
+  if (!nrow(dd)) return(invisible(NULL))
+
+  ord_col <- intersect(c("p.adjust", "qvalue", "qvalues", "padj", "pval"), names(dd))[1]
+  if (!is.na(ord_col)) dd <- dd[order(dd[[ord_col]]), , drop = FALSE]
+  readr::write_tsv(dd, path)
+}
+
+quick_dot <- function(ek, out_png, topn = TOP_N, title = NULL) {
+  if (is.null(ek)) return(invisible(NULL))
+  d <- as.data.frame(ek)
+  if (!nrow(d)) return(invisible(NULL))
+
+  d <- d[order(d$p.adjust), , drop = FALSE] %>% head(topn)
+
+  p <- ggplot(d, aes(
+    x = reorder(Description, -p.adjust),
+    y = -log10(pmax(p.adjust, 1e-300)),
+    size = Count,
+    color = -log10(pmax(p.adjust, 1e-300))
+  )) +
+    geom_point() +
+    coord_flip() +
+    labs(x = NULL, y = "-log10(FDR)", title = title, color = "-log10(FDR)") +
+    theme_minimal(base_size = 11)
+
+  ggsave(out_png, plot = p, width = 6, height = 4, dpi = 150)
+}
+
+term2gene <- msig_term2gene()
+
+for (bin in BINS) {
+  for (direction in c("UP", "DOWN")) {
+    message("\n== ", bin, " / ", direction, " ==")
+
+    genes <- get_common_list(bin, direction) %>% as_chr() %>% unique()
+    genes <- genes[!is.na(genes) & nzchar(genes)]
+    message("  Concordant genes: ", length(genes))
+
+    writeLines(genes, file.path(OUT_DIR, sprintf("common_%s_%s.txt", bin, direction)))
+
+    if (length(genes) < 10) {
+      message("  Fewer than 10 genes; ORA skipped and gene list saved.")
+      next
     }
-  }
 
-  if (!length(scores)) return(10)
-  xmax <- max(scores, na.rm = TRUE)
-  ceiling(xmax * 1.15 * 2) / 2
+    t115 <- load_dea("GSE115002", bin)
+    t750 <- load_dea("GSE75037", bin)
+    universe <- intersect(unique(t115$GENE), unique(t750$GENE))
+    universe <- universe[!is.na(universe) & nzchar(universe)]
+
+    map_all <- to_entrez(universe)
+    map_sel <- to_entrez(genes)
+
+    if (!nrow(map_sel) || !nrow(map_all)) {
+      message("  Empty ENTREZ mapping; GO ORA skipped.")
+      go_bp <- go_cc <- go_mf <- NULL
+    } else {
+      go_bp <- run_enrich_go(map_sel$ENTREZID, map_all$ENTREZID, "BP")
+      go_cc <- run_enrich_go(map_sel$ENTREZID, map_all$ENTREZID, "CC")
+      go_mf <- run_enrich_go(map_sel$ENTREZID, map_all$ENTREZID, "MF")
+    }
+
+    pw_en <- run_enrich_terms(genes, universe, term2gene)
+
+    pref <- file.path(OUT_DIR, sprintf("%s_%s_ORA_common", bin, direction))
+
+    save_table(go_bp, paste0(pref, "_GO_BP.tsv"))
+    save_table(go_cc, paste0(pref, "_GO_CC.tsv"))
+    save_table(go_mf, paste0(pref, "_GO_MF.tsv"))
+    save_table(pw_en, paste0(pref, "_PATHWAY.tsv"))
+
+    quick_dot(go_bp, paste0(pref, "_GO_BP.png"), title = sprintf("%s %s GO:BP", bin, direction))
+    quick_dot(go_cc, paste0(pref, "_GO_CC.png"), title = sprintf("%s %s GO:CC", bin, direction))
+    quick_dot(go_mf, paste0(pref, "_GO_MF.png"), title = sprintf("%s %s GO:MF", bin, direction))
+    quick_dot(pw_en, paste0(pref, "_PATHWAY.png"), title = sprintf("%s %s Pathways", bin, direction))
+  }
 }
 
-# -------------------------------------------------------------------------
-# Run lollipop plots
-# -------------------------------------------------------------------------
-
-GLOBAL_XMAX <- get_global_xmax()
-message("Global x-axis maximum: ", GLOBAL_XMAX)
-
-make_lollipop("old",   "UP",   xmax = GLOBAL_XMAX)
-make_lollipop("old",   "DOWN", xmax = GLOBAL_XMAX)
-make_lollipop("young", "UP",   xmax = GLOBAL_XMAX)
-make_lollipop("young", "DOWN", xmax = GLOBAL_XMAX)
-
-message("Done. Check: ", OUT_DIR)
+message("\nCommon ORA completed. Check: ", OUT_DIR)
